@@ -75,14 +75,15 @@ func (q QueryResult) Passed() bool {
 // Errors produced by rego should be considered separate
 // from other classes of exceptions.
 type CheckResult struct {
-	FileName   string        `json:"filename"`
-	Namespace  string        `json:"namespace"`
-	Successes  int           `json:"successes"`
-	Skipped    []Result      `json:"skipped,omitempty"`
-	Warnings   []Result      `json:"warnings,omitempty"`
-	Failures   []Result      `json:"failures,omitempty"`
-	Exceptions []Result      `json:"exceptions,omitempty"`
-	Queries    []QueryResult `json:"queries,omitempty"`
+	FileName       string        `json:"filename"`
+	Namespace      string        `json:"namespace"`
+	Successes      int           `json:"successes"`
+	Skipped        []Result      `json:"skipped,omitempty"`
+	Warnings       []Result      `json:"warnings,omitempty"`
+	Failures       []Result      `json:"failures,omitempty"`
+	FutureFailures []Result      `json:"future-failures,omitempty"`
+	Exceptions     []Result      `json:"exceptions,omitempty"`
+	Queries        []QueryResult `json:"queries,omitempty"`
 }
 
 // ExitCode returns the exit code that should be returned

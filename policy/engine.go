@@ -9,11 +9,13 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/open-policy-agent/conftest/output"
 	"github.com/open-policy-agent/conftest/parser"
 
 	"github.com/open-policy-agent/opa/ast"
+	"github.com/open-policy-agent/opa/bundle"
 	"github.com/open-policy-agent/opa/loader"
 	"github.com/open-policy-agent/opa/rego"
 	"github.com/open-policy-agent/opa/storage"
@@ -24,17 +26,26 @@ import (
 
 // Engine represents the policy engine.
 type Engine struct {
-	trace    bool
-	modules  map[string]*ast.Module
-	compiler *ast.Compiler
-	store    storage.Store
-	policies map[string]string
-	docs     map[string]string
+	trace       bool
+	modules     map[string]*ast.Module
+	compiler    *ast.Compiler
+	annotations *ast.AnnotationSet
+	store       storage.Store
+	policies    map[string]string
+	docs        map[string]string
+}
+
+// TODO: This is mostly a copy of loader.AllRego but with a modified file loader so
+// annotations are not skipped.
+func allRegos(paths []string) (*loader.Result, error) {
+	return loader.NewFileLoader().WithProcessAnnotation(true).Filtered(paths, func(_ string, info os.FileInfo, depth int) bool {
+		return !info.IsDir() && !strings.HasSuffix(info.Name(), bundle.RegoExt)
+	})
 }
 
 // Load returns an Engine after loading all of the specified policies.
 func Load(ctx context.Context, policyPaths []string, c *ast.Capabilities) (*Engine, error) {
-	policies, err := loader.AllRegos(policyPaths)
+	policies, err := allRegos(policyPaths)
 	if err != nil {
 		return nil, fmt.Errorf("load: %w", err)
 	} else if len(policies.Modules) == 0 {
@@ -57,9 +68,10 @@ func Load(ctx context.Context, policyPaths []string, c *ast.Capabilities) (*Engi
 	}
 
 	engine := Engine{
-		modules:  policies.ParsedModules(),
-		compiler: compiler,
-		policies: policyContents,
+		modules:     policies.ParsedModules(),
+		annotations: compiler.GetAnnotationSet(),
+		compiler:    compiler,
+		policies:    policyContents,
 	}
 
 	return &engine, nil
@@ -152,6 +164,7 @@ func (e *Engine) Check(ctx context.Context, configs map[string]interface{}, name
 
 				checkResult.Successes = checkResult.Successes + result.Successes
 				checkResult.Failures = append(checkResult.Failures, result.Failures...)
+				checkResult.FutureFailures = append(checkResult.FutureFailures, result.FutureFailures...)
 				checkResult.Warnings = append(checkResult.Warnings, result.Warnings...)
 				checkResult.Exceptions = append(checkResult.Exceptions, result.Exceptions...)
 				checkResult.Queries = append(checkResult.Queries, result.Queries...)
@@ -252,12 +265,19 @@ func (e *Engine) check(ctx context.Context, path string, config interface{}, nam
 		return output.CheckResult{}, fmt.Errorf("add file info: %w", err)
 	}
 
+	effectiveOns := map[string]time.Time{}
+
 	var rules []string
 	var ruleCount int
 	for _, module := range e.Modules() {
 		currentNamespace := strings.Replace(module.Package.Path.String(), "data.", "", 1)
 		if currentNamespace != namespace {
 			continue
+		}
+
+		annotationSet, err := ast.BuildAnnotationSet([]*ast.Module{module})
+		if err != nil {
+			return output.CheckResult{}, err
 		}
 
 		// When performing policy evaluation using Check, there are a few rules that are special (e.g. warn and deny).
@@ -279,6 +299,22 @@ func (e *Engine) check(ctx context.Context, path string, config interface{}, nam
 
 			if !contains(rules, currentRule) {
 				rules = append(rules, currentRule)
+				for _, a := range annotationSet.Chain(module.Rules[r]) {
+					if a.Annotations == nil {
+						continue
+					}
+					if rawEffectiveOn, ok := a.Annotations.Custom["effective_on"]; ok {
+						if effectiveOnString, ok := rawEffectiveOn.(string); ok {
+							if effectiveOn, err := time.Parse(time.RFC3339, effectiveOnString); err == nil {
+								// TODO: Annotations will get jumbled if there are multiple rules with
+								// the same name... Operate on some other kind of rule ID? Or... just
+								// change "rules" to be a slice of ast.Rule instead of string slice.
+								// This may not be possible given how conftest handles rules below.
+								effectiveOns[currentRule] = effectiveOn
+							}
+						}
+					}
+				}
 			}
 		}
 	}
@@ -318,6 +354,7 @@ func (e *Engine) check(ctx context.Context, path string, config interface{}, nam
 		}
 
 		var failures []output.Result
+		var futureFailures []output.Result
 		var warnings []output.Result
 		for _, ruleResult := range ruleQueryResult.Results {
 
@@ -333,13 +370,18 @@ func (e *Engine) check(ctx context.Context, path string, config interface{}, nam
 			}
 
 			if isFailure(rule) {
-				failures = append(failures, ruleResult)
+				if isFutureFailure(rule, effectiveOns) {
+					futureFailures = append(futureFailures, ruleResult)
+				} else {
+					failures = append(failures, ruleResult)
+				}
 			} else {
 				warnings = append(warnings, ruleResult)
 			}
 		}
 
 		checkResult.Failures = append(checkResult.Failures, failures...)
+		checkResult.FutureFailures = append(checkResult.FutureFailures, futureFailures...)
 		checkResult.Warnings = append(checkResult.Warnings, warnings...)
 		checkResult.Exceptions = append(checkResult.Exceptions, exceptions...)
 
@@ -487,6 +529,11 @@ func isWarning(rule string) bool {
 func isFailure(rule string) bool {
 	failureRegex := regexp.MustCompile("^(deny|violation)(_[a-zA-Z0-9]+)*$")
 	return failureRegex.MatchString(rule)
+}
+
+func isFutureFailure(rule string, effectiveOns map[string]time.Time) bool {
+	effectiveOn, ok := effectiveOns[rule]
+	return ok && effectiveOn.After(time.Now())
 }
 
 func contains(collection []string, item string) bool {
